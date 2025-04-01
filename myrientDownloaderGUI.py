@@ -1,7 +1,5 @@
 import os
-import subprocess
 import zipfile
-import sys
 import platform
 import shutil
 import signal
@@ -10,124 +8,22 @@ import multiprocessing
 import urllib
 import urllib.request
 import urllib.parse
-import json
-import time
 import pickle
-import random
-import threading
-import asyncio
+from typing import Callable
+
 import requests
-import aiohttp
-import yaml  # Import PyYAML
-from pathlib import Path
-from urllib.parse import unquote
-from bs4 import BeautifulSoup
+import yaml
 from PyQt5.QtWidgets import QApplication, QGridLayout, QGroupBox, QWidget, QVBoxLayout, \
     QPushButton, QComboBox, QLineEdit, QListWidget, QLabel, QCheckBox, QTextEdit, \
     QFileDialog, QDialog, QHBoxLayout, QAbstractItemView, QProgressBar, \
     QTabWidget, QListWidgetItem, QTableWidget, QTableWidgetItem
-from PyQt5.QtCore import QThread, pyqtSignal, QSettings, QEventLoop, Qt, QTimer, QThreadPool
+from PyQt5.QtCore import QSettings, Qt, QTimer
 from PyQt5.QtGui import QTextCursor
 import sys
 import traceback
 
-class GetSoftwareListThread(QThread):
-    signal = pyqtSignal('PyQt_PyObject')
-
-    def __init__(self, url, json_file):
-        super().__init__()
-        self.url = url
-        self.json_file = json_file
-        self.running = True
-
-    def run(self):
-        try:
-            iso_list = []
-            if os.path.exists(self.json_file):
-                with open(self.json_file, 'r') as file:
-                    iso_list = json.load(file)
-            if not iso_list and self.running:
-                response = requests.get(self.url)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                iso_list = [(unquote(link.get('href')), link.find_next('td', class_='size').text.strip()) 
-                            for link in soup.find_all('a', href=lambda href: href and href.endswith('.zip'))]
-                with open(self.json_file, 'w') as file:
-                    json.dump(iso_list, file)
-
-            if self.running:
-                self.signal.emit(iso_list)
-        except Exception as e:
-            print(f"Error in GetSoftwareListThread: {e}")
-            traceback.print_exc()
-
-    def stop(self):
-        self.running = False
-
-class SplitPkgThread(QThread):
-    progress = pyqtSignal(str)
-    status = pyqtSignal(bool)
-
-    def __init__(self, file_path):
-        QThread.__init__(self)
-        self.file_path = file_path
-
-    def run(self):
-        file_size = os.path.getsize(self.file_path)
-        if file_size < 4294967295:
-            self.status.emit(False)
-            return
-        else:
-            chunk_size = 4294967295
-            num_parts = -(-file_size // chunk_size)
-            with open(self.file_path, 'rb') as f:
-                i = 0
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    with open(f"{Path(self.file_path).stem}.pkg.666{str(i).zfill(2)}", 'wb') as chunk_file:
-                        chunk_file.write(chunk)
-                    print(f"Splitting {self.file_path}: part {i+1}/{num_parts} complete")
-                    self.progress.emit(f"Splitting {self.file_path}: part {i+1}/{num_parts} complete")
-                    i += 1
-            os.remove(self.file_path)
-            self.status.emit(True)
-
-class SplitIsoThread(QThread):
-    progress = pyqtSignal(str)
-    status = pyqtSignal(bool)
-    finished = pyqtSignal(list)  # Add this line
-
-    def __init__(self, file_path):
-        QThread.__init__(self)
-        self.file_path = file_path
-
-    def run(self):
-        file_size = os.path.getsize(self.file_path)
-        if file_size < 4294967295:
-            self.status.emit(False)
-            self.finished.emit([])  # Add this line
-            return
-        else:
-            chunk_size = 4294967295
-            num_parts = -(-file_size // chunk_size)
-            split_files = []  # Add this line
-            with open(self.file_path, 'rb') as f:
-                i = 0
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    split_file = f"{os.path.splitext(self.file_path)[0]}.iso.{str(i)}"
-                    with open(split_file, 'wb') as chunk_file:
-                        chunk_file.write(chunk)
-                    split_files.append(split_file)  # Add this line
-                    msg = f"Splitting {self.file_path}: part {i+1}/{num_parts} complete"
-                    print(msg)
-                    self.progress.emit(msg)
-                    i += 1
-            self.status.emit(True)
-            self.finished.emit(split_files)  # Add this line
+from lib.runners import CommandRunner, UnzipRunner
+from lib.threads import GetSoftwareListThread, SplitPkgThread, SplitIsoThread, FileOperationsThread, DownloadThread
 
 
 class OutputWindow(QTextEdit):
@@ -146,199 +42,12 @@ class OutputWindow(QTextEdit):
     def flush(self):
         pass
 
-# Function to run a command and check its success
-class CommandRunner(QThread):
-    finished = pyqtSignal()
-
-    def __init__(self, command):
-        super().__init__()
-        self.command = command
-
-    def run(self):
-        process = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, bufsize=1, universal_newlines=True)
-        
-        # If on Windows, send a newline character to ps3dec's standard input
-        if platform.system() == 'Windows':
-            process.stdin.write('\n')
-            process.stdin.flush()
-        
-        def reader_thread(process):
-            for line in iter(process.stdout.readline, ''):
-                print(line.rstrip('\n')) 
-                QApplication.processEvents()
-
-        thread = threading.Thread(target=reader_thread, args=(process,))
-        thread.start()
-        process.wait()
-        thread.join()
-
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, self.command)
-        self.finished.emit()
-
-class UnzipRunner(QThread):
-    progress_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal(list)
-
-    def __init__(self, zip_path, output_path):
-        super().__init__()
-        self.zip_path = zip_path
-        self.output_path = output_path
-        self.extracted_files = []
-        self.running = True
-
-    def run(self):
-        if not self.zip_path.lower().endswith('.zip'):
-            print(f"File {self.zip_path} is not a .zip file. Skipping unzip.")
-            self.finished_signal.emit([])
-            return
-
-        with zipfile.ZipFile(self.zip_path, 'r') as zip_ref:
-            total_size = sum([info.file_size for info in zip_ref.infolist()])
-            extracted_size = 0
-
-            for info in zip_ref.infolist():
-                if not self.running:
-                    break
-                # Extract to self.output_path
-                zip_ref.extract(info, self.output_path)
-                extracted_file_path = os.path.join(self.output_path, info.filename)
-                self.extracted_files.append(extracted_file_path)
-                extracted_size += info.file_size
-                self.progress_signal.emit(int((extracted_size / total_size) * 100))
-                QApplication.processEvents()
-
-        self.finished_signal.emit(self.extracted_files)
-
-    def stop(self):
-        self.running = False
-
-class FileOperationsThread(QThread):
-    progress_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, operations):
-        super().__init__()
-        self.operations = operations
-
-    def run(self):
-        for operation in self.operations:
-            try:
-                if operation['type'] == 'rename':
-                    self.progress_signal.emit(f"Renaming {operation['src']} to {operation['dst']}")
-                    os.rename(operation['src'], operation['dst'])
-                elif operation['type'] == 'move':
-                    self.progress_signal.emit(f"Moving {operation['src']} to {operation['dst']}")
-                    shutil.move(operation['src'], operation['dst'])
-                elif operation['type'] == 'remove':
-                    self.progress_signal.emit(f"Removing {operation['src']}")
-                    if os.path.isdir(operation['src']):
-                        shutil.rmtree(operation['src'])
-                    else:
-                        os.remove(operation['src'])
-                self.progress_signal.emit(f"Performed {operation['type']} operation")
-            except Exception as e:
-                self.progress_signal.emit(f"Error during {operation['type']}: {e}")
-                print(f"Error during {operation['type']}: {e}")
-        self.finished_signal.emit()
-
-class DownloadThread(QThread):
-    progress_signal = pyqtSignal(int)
-    speed_signal = pyqtSignal(str)
-    eta_signal = pyqtSignal(str)
-    download_complete_signal = pyqtSignal()
-
-    def __init__(self, url, filename, retries=50):
-        QThread.__init__(self)
-        self.url = url
-        self.filename = filename
-        self.retries = retries
-        self.existing_file_size = 0
-        self.start_time = None
-        self.total_downloaded = 0
-        self.running = True
-
-    async def download(self):
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-        }
-
-        for i in range(self.retries):
-            try:
-                if os.path.exists(self.filename):
-                    self.existing_file_size = os.path.getsize(self.filename)
-                    headers['Range'] = f'bytes={self.existing_file_size}-'
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(self.url, headers=headers) as response:
-                        if response.status not in (200, 206):
-                            raise aiohttp.ClientPayloadError()
-
-                        if 'content-range' in response.headers:
-                            total_size = int(response.headers['content-range'].split('/')[-1])
-                        else:
-                            total_size = int(response.headers.get('content-length'))
-
-                        with open(self.filename, 'ab') as file:
-                            self.start_time = time.time()
-                            self.total_downloaded = self.existing_file_size
-                            while True:
-                                chunk = await response.content.read(8192)
-                                if not chunk:
-                                    break
-                                file.write(chunk)
-                                self.total_downloaded += len(chunk)
-                                self.progress_signal.emit(int((self.total_downloaded / total_size) * 100))
-
-                                # Calculate speed and ETA
-                                elapsed_time = time.time() - self.start_time
-                                if elapsed_time > 0:
-                                    speed = (self.total_downloaded - self.existing_file_size) / elapsed_time
-                                else:
-                                    speed = 0
-                                remaining_bytes = total_size - self.total_downloaded
-                                eta = remaining_bytes / speed if speed > 0 else 0
-
-                                # Convert speed to appropriate units
-                                if speed > 1024**2:
-                                    speed_str = f"{speed / (1024**2):.2f} MB/s"
-                                else:
-                                    speed_str = f"{speed / 1024:.2f} KB/s"
-
-                                # Convert ETA to appropriate units
-                                if eta >= 60:
-                                    minutes, seconds = divmod(int(eta), 60)
-                                    eta_str = f"{minutes} minutes {seconds} seconds remaining"
-                                else:
-                                    eta_str = f"{eta:.2f} seconds remaining"
-
-                                # Emit the speed and ETA signals
-                                self.speed_signal.emit(speed_str)
-                                self.eta_signal.emit(eta_str)
-
-                # If the download was successful, break the loop
-                break
-            except aiohttp.ClientPayloadError:
-                print(f"Download interrupted. Retrying ({i+1}/{self.retries})...")
-                await asyncio.sleep(2 ** i + random.random())  # Exponential backoff
-                if i == self.retries - 1:  # If this was the last retry
-                    raise  # Re-raise the exception
-            except asyncio.TimeoutError:
-                print(f"Download interrupted. Retrying ({i+1}/{self.retries})...")
-                await asyncio.sleep(2 ** i + random.random())  # Exponential backoff
-                if i == self.retries - 1:  # If this was the last retry
-                    raise  # Re-raise the exception
-
-    def run(self):
-        asyncio.run(self.download())
-        self.download_complete_signal.emit()
-
-    def stop(self):
-        self.running = False
 
 class GUIDownloader(QWidget):
     def __init__(self):
         super().__init__()
+        #signal.signal(signal.SIGINT, self.closeEvent)
+        self.threads = []  # Store thread references
         # Load the user's settings
         self.settings = QSettings('./myrientDownloaderGUI.ini', QSettings.IniFormat)
         self.ps3dec_binary = self.settings.value('ps3dec_binary', '')
@@ -425,6 +134,7 @@ class GUIDownloader(QWidget):
             raise
 
     def closeEvent(self, event):
+        # TODO: remove after daemon implemented
         print("Closing application...")
         self.stop_threads()
         # Save the queue to 'queue.txt'
@@ -439,23 +149,36 @@ class GUIDownloader(QWidget):
             for thread in self.threads:
                 thread.stop()
         print("Threads stopped.")
+
     def initUI(self):
+        def new_button(parent: GUIDownloader, label: str, click_action: Callable, enabled: bool=True) -> QPushButton:
+            button = QPushButton(label, self)
+            button.clicked.connect(click_action)
+            button.setEnabled(enabled)
+            parent.addWidget(button)
+            return button
+
+        def new_checkbox(parent: GUIDownloader, label: str, pos: tuple[int, int], checked: bool=False) -> QCheckBox:
+            checkbox = QCheckBox(label, self)
+            checkbox.setChecked(checked)
+            parent.addWidget(checkbox, *pos)
+            return checkbox
+
         print("Setting up UI...")
         vbox = QVBoxLayout()
 
         # Add a header for the Manufacturer list
-        manufacturer_header = QLabel('Manufacturer')
-        vbox.addWidget(manufacturer_header)
+        vbox.addWidget(QLabel('Manufacturer'))
 
         # Combobox for Manufacturer
         self.manufacturer = QComboBox(self)
-        manufacturers = sorted(list(set(system.get('manufacturer', 'Unknown') for system in self.systems_data.values())))
-        self.manufacturer.addItems(manufacturers)
+        self.manufacturer.addItems(
+                sorted(list(set(system.get('manufacturer', 'Unknown') for system in self.systems_data.values())))
+        )
         vbox.addWidget(self.manufacturer)
         
         # Add a header for the software list
-        iso_list_header = QLabel('Software')
-        vbox.addWidget(iso_list_header)
+        vbox.addWidget(QLabel('Software'))
 
         # Create a search box
         self.search_box = QLineEdit(self)
@@ -487,23 +210,16 @@ class GUIDownloader(QWidget):
         hbox = QHBoxLayout()
 
         # Create a button to add to queue
-        self.add_to_queue_button = QPushButton('Add to Queue', self)
-        self.add_to_queue_button.clicked.connect(self.add_to_queue)
-        self.add_to_queue_button.setEnabled(False)  # Disable button initially
-        hbox.addWidget(self.add_to_queue_button)
+        self.add_to_queue_button = new_button(hbox, 'Add to Queue', self.add_to_queue, False)
 
         # Create a button to remove from queue
-        self.remove_from_queue_button = QPushButton('Remove from Queue', self)
-        self.remove_from_queue_button.clicked.connect(self.remove_from_queue)
-        self.remove_from_queue_button.setEnabled(False)  # Disable button initially
-        hbox.addWidget(self.remove_from_queue_button)
+        self.remove_from_queue_button = new_button(hbox, 'Remove from Queue', self.remove_from_queue, False)
 
         # Add the horizontal box layout to the vertical box layout
         vbox.addLayout(hbox)
 
         # Add a header for the Queue
-        queue_header = QLabel('Queue')
-        vbox.addWidget(queue_header)
+        vbox.addWidget(QLabel('Queue'))
 
         # Create queue list
         self.queue_list = QListWidget(self)
@@ -515,61 +231,32 @@ class GUIDownloader(QWidget):
         grid = QGridLayout()
 
         # Add a header for the options
-        iso_options_header = QLabel('ISO Settings')
-        grid.addWidget(iso_options_header, 0, 0)
-
-        pkg_options_header = QLabel('PKG Settings')
-        grid.addWidget(pkg_options_header, 0, 1)
-
+        grid.addWidget(QLabel('ISO Settings'), 0, 0)
         # Create a checkbox for decrypting the file
-        self.decrypt_checkbox = QCheckBox('Decrypt (if necessary)', self)
-        self.decrypt_checkbox.setChecked(True)  # Enable checkbox by default
-        grid.addWidget(self.decrypt_checkbox, 1, 0)
-
+        self.decrypt_checkbox = new_checkbox(grid, 'Decrypt (if necessary)', (1, 0), True)
         # Create a checkbox for keeping or deleting the encrypted ISO file
-        self.keep_enc_checkbox = QCheckBox('Keep encrypted ISO', self)
-        self.keep_enc_checkbox.setChecked(False)
-        grid.addWidget(self.keep_enc_checkbox, 2, 0)
-
-        # Create a checkbox for splitting the file for FAT32 filesystems
-        self.split_checkbox = QCheckBox('Split for FAT32 (if > 4GB)', self)
-        self.split_checkbox.setChecked(True)  # Enable checkbox by default
-        grid.addWidget(self.split_checkbox, 3, 0)
-
+        self.keep_enc_checkbox = new_checkbox(grid, 'Keep encrypted ISO', (2, 0), False)
+        # Create a checkbox for splitting the file for FAT31 filesystems
+        self.split_checkbox = new_checkbox(grid, 'Split for FAT31 (if > 4GB)', (3, 0), True)
         # Create a checkbox for keeping or deleting the unsplit decrypted ISO file
-        self.keep_unsplit_dec_checkbox = QCheckBox('Keep unsplit ISO', self)
-        self.keep_unsplit_dec_checkbox.setChecked(False)
-        grid.addWidget(self.keep_unsplit_dec_checkbox, 4, 0)
+        self.keep_unsplit_dec_checkbox = new_checkbox(grid, 'Keep unsplit ISO', (4, 0), False)
+        # Create a checkbox for keeping or deleting the dkey file
+        self.keep_dkey_checkbox = new_checkbox(grid, 'Keep dkey file', (5, 0), False)
+        # create a checkbox for debugging mode
+        self.debug_checkbox = new_checkbox(grid, 'Debug Mode (Print URLs only)', (6, 0), False)
 
+        grid.addWidget(QLabel('PKG Settings'), 0, 1)
         # Create a checkbox for splitting the PKG file
-        self.split_pkg_checkbox = QCheckBox('Split PKG', self)
-        self.split_pkg_checkbox.setChecked(True) # Enable checkbox by default
-        grid.addWidget(self.split_pkg_checkbox, 1, 1)
-
+        self.split_pkg_checkbox = new_checkbox(grid, 'Split PKG', (1, 1), True)
         # Create a checkbox for keeping or deleting the unsplit PKG file
-        self.keep_unsplit_pkg_checkbox = QCheckBox('Keep unsplit PKG', self)
-        self.keep_unsplit_pkg_checkbox.setChecked(False)
-        grid.addWidget(self.keep_unsplit_pkg_checkbox, 2, 1)  # Adjust the position as needed
+        self.keep_unsplit_pkg_checkbox = new_checkbox(grid, 'Keep unsplit PKG', (2, 1), False)
 
         # Connect the stateChanged signal of the split_pkg_checkbox to a slot that shows or hides the keep_unsplit_pkg_checkbox
         self.split_pkg_checkbox.stateChanged.connect(self.keep_unsplit_pkg_checkbox.setVisible)
-
         # Initially hide the keep_unsplit_pkg_checkbox if split_pkg_checkbox is unchecked
         self.keep_unsplit_pkg_checkbox.setVisible(self.split_pkg_checkbox.isChecked())
-
-        # Create a checkbox for keeping or deleting the dkey file
-        self.keep_dkey_checkbox = QCheckBox('Keep dkey file', self)
-        self.keep_dkey_checkbox.setChecked(False)
-        grid.addWidget(self.keep_dkey_checkbox, 5, 0)
-
-        # create a checkbox for debugging mode
-        self.debug_checkbox = QCheckBox('Debug Mode (Print URLs only)', self)
-        self.debug_checkbox.setChecked(False)
-        grid.addWidget(self.debug_checkbox, 6, 0)
-        
         # Connect the stateChanged signal of the decrypt_checkbox to a slot that shows or hides the keep_enc_checkbox
         self.decrypt_checkbox.stateChanged.connect(self.keep_enc_checkbox.setVisible)
-
         # Connect the stateChanged signal of the split_checkbox to a slot that shows or hides the keep_unsplit_dec_checkbox
         self.split_checkbox.stateChanged.connect(self.keep_unsplit_dec_checkbox.setVisible)
 
@@ -579,34 +266,27 @@ class GUIDownloader(QWidget):
         vbox.addWidget(group_box)
 
         # Create a settings button
-        self.settings_button = QPushButton('Settings', self)
-        self.settings_button.clicked.connect(self.open_settings)
-        vbox.addWidget(self.settings_button)
+        self.settings_button = new_button(vbox, 'Settings', self.open_settings)
 
         # Create a button to start the process
-        self.start_button = QPushButton('Start', self)
-        self.start_button.clicked.connect(self.start_download)
-        vbox.addWidget(self.start_button)
+        self.start_button = new_button(vbox, 'Start', self.start_download)
 
         # Add a header for the Output Window
-        output_window_header = QLabel('Logs')
-        vbox.addWidget(output_window_header)
+        vbox.addWidget(QLabel('Logs'))
 
         # Create an output window
         self.output_window = OutputWindow(self)
         vbox.addWidget(self.output_window)
 
         # Add a header for the progress bar
-        queue_header = QLabel('Progress')
-        vbox.addWidget(queue_header)
+        vbox.addWidget(QLabel('Progress'))
 
         # Create a progress bar and add it to the layout
         self.progress_bar = QProgressBar(self)
         vbox.addWidget(self.progress_bar)
 
         # Add a header for the speed, eta
-        queue_header = QLabel('Download Speed & ETA')
-        vbox.addWidget(queue_header)
+        vbox.addWidget(QLabel('Download Speed & ETA'))
 
         # Create labels for download speed and ETA
         self.download_speed_label = QLabel(self)
@@ -638,38 +318,36 @@ class GUIDownloader(QWidget):
                 is_visible = (system.get('manufacturer', 'Unknown') == selected_manufacturer)
                 self.result_list.setTabVisible(index, is_visible)
 
-    def load_software_lists(self):
-        print("Loading software lists...")
+    def load_software_lists(self, rebuild=False):
+        # TODO: delete after daemon
         try:
-            self.threads = []  # Store thread references
             for index, system in self.systems_data.items():
                 json_filename = f"{system['name'].replace(' ', '_').lower()}_list.json"
-                thread = GetSoftwareListThread(system['url'], json_filename)
+                thread = GetSoftwareListThread(system['url'], json_filename, rebuild)
                 thread.signal.connect(lambda iso_list, idx=index: self.set_system_list(idx, iso_list))
                 self.threads.append(thread)  # Keep a reference to the thread
                 thread.finished.connect(thread.deleteLater)  # Ensure thread is deleted when finished
                 thread.start()
-            print("Software list loading initiated.")
+            print("loading ISO list cache...")
+
         except Exception as e:
-            print(f"Error loading software lists: {e}")
+            print(f"FATAL:: Error loading ISO lists: {e}")
             traceback.print_exc()
 
     def start_download(self):
-        # Disable the GUI buttons
-        self.settings_button.setEnabled(False)
-        self.add_to_queue_button.setEnabled(False)
-        self.remove_from_queue_button.setEnabled(False)
-        self.decrypt_checkbox.setEnabled(False)
-        self.split_checkbox.setEnabled(False)
-        self.keep_dkey_checkbox.setEnabled(False)
-        self.keep_enc_checkbox.setEnabled(False)
-        self.keep_unsplit_dec_checkbox.setEnabled(False)
-        self.split_pkg_checkbox.setEnabled(False)
-        self.keep_dkey_checkbox.setEnabled(False)
-        self.keep_unsplit_pkg_checkbox.setEnabled(False)
-        self.start_button.setEnabled(False)
-
+        self._set_enabled_clickables(False)
         self.process_next_item()
+
+    def _set_enabled_clickables(self, enabled: bool):
+        """
+        this function enables or disables GUI buttons while downloading
+        """
+        for clickable in (
+                self.settings_button, self.add_to_queue_button, self.remove_from_queue_button,
+                self.decrypt_checkbox, self.split_checkbox, self.keep_dkey_checkbox,
+                self.keep_enc_checkbox, self.keep_unsplit_dec_checkbox, self.split_pkg_checkbox,
+                self.keep_dkey_checkbox, self.keep_unsplit_pkg_checkbox, self.start_button):
+            clickable.setEnabled(enabled)
 
     def process_next_item(self):
         if self.queue_list.count() > 0:
@@ -710,18 +388,7 @@ class GUIDownloader(QWidget):
                 pickle.dump([(self.queue_list.item(i).text(), self.queue_list.item(i).data(Qt.UserRole)) for i in range(self.queue_list.count())], file)
 
             # Re-enable the buttons
-            self.settings_button.setEnabled(True)
-            self.add_to_queue_button.setEnabled(True)
-            self.remove_from_queue_button.setEnabled(True)
-            self.decrypt_checkbox.setEnabled(True)
-            self.split_checkbox.setEnabled(True)
-            self.keep_dkey_checkbox.setEnabled(True)
-            self.keep_enc_checkbox.setEnabled(True)
-            self.keep_unsplit_dec_checkbox.setEnabled(True)
-            self.split_pkg_checkbox.setEnabled(True)
-            self.keep_dkey_checkbox.setEnabled(True)
-            self.keep_unsplit_pkg_checkbox.setEnabled(True)
-            self.start_button.setEnabled(True)
+            self._set_enabled_clickables(True)
 
     def downloadhelper(self, selected_iso, queue_position, url, callback):
         # URL-encode the selected_iso
@@ -1311,7 +978,7 @@ class GUIDownloader(QWidget):
         self.settings_welcome_dialog("Welcome!", "Continue", welcome_text=welcome_text)
 
     def update_iso_list(self):
-        self.load_software_lists()
+        self.load_software_lists(rebuild=True)
 
     def is_valid_binary(self, path, binary_name):
         # Check if the path is not empty, the file exists and the filename ends with the correct binary name
