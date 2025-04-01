@@ -437,9 +437,7 @@ class GUIDownloader(QWidget):
         print("Stopping threads...")
         if hasattr(self, 'threads'):
             for thread in self.threads:
-                if thread.isRunning():
-                    thread.stop()
-                    thread.wait()
+                thread.stop()
         print("Threads stopped.")
     def initUI(self):
         print("Setting up UI...")
